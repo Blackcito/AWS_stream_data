@@ -1,0 +1,20 @@
+services:
+  floci:
+    image: floci/floci:latest
+    container_name: floci
+    ports:
+      - "4566:4566"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:z
+    security_opt:
+      - label=disable
+
+  floci-dash:
+    image: ghcr.io/ofsazib/floci-dash:latest
+    container_name: floci-dash
+    ports:
+      - "3000:3000"
+    environment:
+      - FLOCI_URL=http://floci:4566
+    depends_on:
+      - floci
