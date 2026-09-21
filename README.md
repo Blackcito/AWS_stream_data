@@ -2,7 +2,7 @@
 
 Pipeline de analítica en tiempo real para planta de manufactura: eventos de sensores, scanner y cinta transportadora se ingieren en streaming, se correlacionan por pieza a través de estaciones, y se exponen como KPIs de ciclo y eficiencia en un dashboard ejecutivo.
 
-Está construido con Kinesis, Lambda, DynamoDB, S3, Athena y Glue — la misma arquitectura que usaría en AWS real — pero corre en local con [Floci](https://floci.io), sin costo ni cuenta de AWS. El `provider` de Terraform apunta a `http://localhost:4566`.
+Está construido con Kinesis, Lambda, DynamoDB, S3, Athena y Glue — la misma arquitectura que usaría en AWS real — pero corre en local con [Floci](https://floci.io), sin costo ni cuenta de AWS. El `provider` de Terraform apunta a `http://localhost:4566`, FlociDash apunta a `http://localhost:3000` y grafana para visualizar graficos apunta a `http://localhost:3001`.
 ## Autoría
 
 Este proyecto es de mi autoría: el diseño de la arquitectura, el código (productor, Lambda, Terraform, scripts y queries), la configuración del dashboard y esta documentación.
