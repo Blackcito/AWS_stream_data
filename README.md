@@ -3,8 +3,6 @@
 Pipeline de analítica en tiempo real para planta de manufactura: eventos de sensores, scanner y cinta transportadora se ingieren en streaming, se correlacionan por pieza a través de estaciones, y se exponen como KPIs de ciclo y eficiencia en un dashboard ejecutivo.
 
 Está construido con Kinesis, Lambda, DynamoDB, S3, Athena y Glue — la misma arquitectura que usaría en AWS real — pero corre en local con [Floci](https://floci.io), sin costo ni cuenta de AWS. El `provider` de Terraform apunta a `http://localhost:4566`.
-
-
 ## Autoría
 
 Este proyecto es de mi autoría: el diseño de la arquitectura, el código (productor, Lambda, Terraform, scripts y queries), la configuración del dashboard y esta documentación.
@@ -29,25 +27,15 @@ Diseñé este pipeline replicando un problema real de planta: correlacionar even
 
 ## Arquitectura
 
-```
-Simulador de eventos (sensores, scanner, cinta)
-            │
-            ▼
-        Kinesis  ──────────────────────  Stream de eventos
-            │
-            ▼
-        Lambda  ───────────────────────  Correlación, deduplicación y calidad
-         │            │
-         ▼            ▼
-   DynamoDB          S3
-   Estado de      Data lake
-   correlación    (raw + processed)
-                      │
-                      ▼
-                Athena + Glue  ─────────  KPIs de ciclo y eficiencia
-                      │
-                      ▼
-                   Grafana  ─────────────  Dashboard ejecutivo
+```mermaid
+flowchart TB
+    Producer["Simulador de eventos<br/>(sensores, scanner, cinta)"] -->|PutRecords| Kinesis["Kinesis<br/>stream de eventos"]
+    Kinesis -->|event source mapping| Lambda["Lambda<br/>correlación · dedup · calidad"]
+    Lambda -->|TransactWriteItems| DynamoDB[("DynamoDB<br/>estado de correlación")]
+    Lambda -->|PutObject| S3[("S3<br/>data lake (raw + processed)")]
+    S3 -->|catálogo| Glue["Glue<br/>metadatos del esquema"]
+    Glue -->|SQL| Athena["Athena<br/>KPIs de ciclo y eficiencia"]
+    Athena -->|datasource| Grafana["Grafana<br/>dashboard ejecutivo"]
 ```
 
 | Componente | Rol |
@@ -60,6 +48,34 @@ Simulador de eventos (sensores, scanner, cinta)
 | **Athena + Glue** | SQL sobre S3 (CTEs, `LAG`, `STDDEV_POP`) para tiempos de ciclo y variabilidad por estación. |
 | **Grafana** | Dashboard ejecutivo con los KPIs resultantes (datasource Athena contra Floci). |
 
+## Diagrama Secuencia
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Producer
+    participant K as Kinesis
+    participant L as Lambda
+    participant D as DynamoDB
+    participant S as S3
+    participant A as Athena / Glue
+    participant G as Grafana
+
+    P->>K: PutRecords(evento, partition_key=piece_id)
+    K->>L: lote de registros (Base64)
+    L->>L: decodificar + validar + clasificar (ok / gap / out_of_order)
+    L->>S: raw/ y processed/ (clave determinista)
+    L->>D: TransactWriteItems (dedup + estado)
+    alt event_id ya existe
+        D-->>L: TransactionCanceledException
+        Note right of L: duplicado: no se toca el estado
+    else evento nuevo
+        D-->>L: confirmado
+    end
+    S->>A: Glue describe el esquema
+    A->>G: Athena consulta y expone KPIs
+    G->>G: dashboard (ciclo, calidad)
+```
 ## Decisiones de diseño
 
 - **Idempotencia en Lambda**: cada evento trae un ID único; se registra en DynamoDB con una escritura condicional y se conserva en S3 con clave determinista, de modo que un reintento de Kinesis no duplica su efecto.
@@ -158,7 +174,6 @@ El checkpoint de lectura de Kinesis lo administra el event source mapping de Lam
 
 La query [queries/cycle_kpis.sql](queries/cycle_kpis.sql) usa dos CTEs y `LAG` para ordenar los eventos por pieza, identificar la estación anterior y calcular métricas agregadas por estación. Athena fue validada sobre nueve eventos sintéticos y devolvió tres eventos por estación, promedios de ciclo de 3, 4 y 5 segundos, y tres segundos de separación media entre estaciones consecutivas.
 
-
 La query [queries/data_quality.sql](queries/data_quality.sql) agrupa los eventos procesados por `station_id` y `quality_status`, y cuenta eventos y piezas afectadas. El catálogo Glue incluye `quality_status` para que Athena pueda consultar la calidad del pipeline.
 
 ### Particionado por fecha
@@ -190,20 +205,6 @@ El dashboard tiene dos paneles:
 - **Calidad por estación y estado**: conteo de eventos y piezas por `quality_status`.
 
 El plugin `grafana-athena-datasource` se instala al arrancar (vía `GF_INSTALL_PLUGINS`) y se configura con un endpoint personalizado y credenciales `test`. En AWS real, se quita el `endpoint` y se usan credenciales/rol reales; el dashboard queda igual.
-
-
-## Roadmap
-
-- [x] Simulador con distintos perfiles de fallo (eventos fuera de orden, duplicados, gaps)
-- [x] Tests de idempotencia para la Lambda
-- [x] Cifrado SSE-S3 y bloqueo de acceso público en S3
-- [x] IAM de mínimo privilegio (permisos por tabla y log group acotado)
-- [x] Logs estructurados en la Lambda
-- [x] Dashboard en Grafana (datasource Athena)
-- [x] CI que valida `terraform validate`/`fmt` y tests unitarios en cada PR
-- [x] CI con `terraform plan` contra Floci (end-to-end)
-- [x] Atomicidad entre deduplicación y actualización de estado (transacción DynamoDB)
-- [x] Particionado por fecha en la tabla Glue (`event_date`)
 
 ## Licencia
 
