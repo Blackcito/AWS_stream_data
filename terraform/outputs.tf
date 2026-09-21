@@ -25,3 +25,15 @@ output "athena_results_bucket" {
 output "lambda_function_name" {
   value = aws_lambda_function.processor.function_name
 }
+
+output "glue_database_name" {
+  value = aws_glue_catalog_database.realtime_pipeline.name
+}
+
+output "glue_table_name" {
+  value = aws_glue_catalog_table.processed_events.name
+}
+
+output "athena_workgroup_name" {
+  value = aws_athena_workgroup.realtime_pipeline.name
+}

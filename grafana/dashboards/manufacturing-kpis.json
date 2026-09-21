@@ -1,0 +1,95 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "athena"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-athena-datasource",
+            "uid": "athena"
+          },
+          "format": 1,
+          "rawSQL": "SELECT station_id, COUNT(*) AS event_count, ROUND(AVG(cycle_time_seconds), 2) AS avg_cycle_time_seconds, ROUND(STDDEV_POP(cycle_time_seconds), 2) AS cycle_time_stddev_seconds FROM processed_events GROUP BY station_id ORDER BY station_id",
+          "refId": "A"
+        }
+      ],
+      "title": "Tiempo de ciclo por estación",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "athena"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-athena-datasource",
+            "uid": "athena"
+          },
+          "format": 1,
+          "rawSQL": "SELECT station_id, quality_status, COUNT(*) AS event_count, COUNT(DISTINCT piece_id) AS piece_count FROM processed_events GROUP BY station_id, quality_status ORDER BY station_id, quality_status",
+          "refId": "A"
+        }
+      ],
+      "title": "Calidad por estación y estado",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "manufacturing",
+    "aws"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Manufacturing KPIs",
+  "uid": "manufacturing-kpis",
+  "version": 1
+}

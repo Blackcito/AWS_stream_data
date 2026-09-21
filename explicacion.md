@@ -112,8 +112,8 @@ Actualmente se han completado estas etapas:
 - Tablas DynamoDB para estado, deduplicacion y checkpoints.
 - Buckets S3 para data lake y resultados de Athena.
 - Rol IAM y politica de permisos para Lambda.
-- Catalogo Glue creado por AWS CLI.
-- Workgroup Athena creado por AWS CLI.
+- Catalogo Glue (base y tabla) via Terraform.
+- Workgroup Athena via Terraform.
 - Producer Python para eventos sinteticos.
 - Deduplicacion por `event_id`.
 - Actualizacion de estado por pieza y estacion.
@@ -123,17 +123,23 @@ Actualmente se han completado estas etapas:
 - Perfiles reproducibles de fallo en el producer.
 - Clasificacion de calidad de eventos en Lambda: `ok`, `gap` y `out_of_order`.
 - Tests unitarios para la deduplicacion.
+- Test de integracion del handler completo (evento nuevo y duplicado).
+- Logs estructurados en JSON en la Lambda.
+- Cifrado SSE-S3 y bloqueo de acceso publico en los buckets S3.
+- Permisos IAM de minimo privilegio por tabla y log group acotado.
+- CI con GitHub Actions que ejecuta tests y `terraform validate`/`fmt`.
+- Dashboard en Grafana con datasource Athena contra Floci.
+- Deduplicacion y actualizacion de estado atomicas via transaccion DynamoDB.
+- Particionado por fecha en la tabla Glue (`event_date`).
 - Script de destruccion controlada del entorno local.
 
 Todavia estan pendientes:
 
 - Deteccion analitica agregada de gaps y eventos fuera de orden en Athena.
 - Checkpoint de negocio explicito en `shard_checkpoints`.
-- Dashboard Grafana.
-- Alertas y metricas de negocio.
+- Alertas en Grafana.
 - Pruebas de carga y pruebas end-to-end automatizadas.
-- Version de Terraform para Glue y Athena cuando se despliegue en AWS real.
-- Endurecimiento de seguridad y estimacion de costos.
+- Lifecycle y politicas de retencion en S3, y estimacion de costos.
 
 ## 3. Servicios utilizados
 
@@ -184,7 +190,7 @@ Tambien existe un bucket separado para resultados de Athena:
 s3://realtime-pipeline-athena-results/
 ```
 
-El bucket del data lake tiene versionado activado. Ambos buckets tienen `force_destroy = true`, una configuracion conveniente para Floci pero que debe revisarse antes de utilizarla en produccion.
+El bucket del data lake tiene versionado activado. Ambos buckets estan cifrados en reposo con SSE-S3 (AES256) y tienen bloqueo de acceso publico. Ambos tienen `force_destroy = true`, una configuracion conveniente para Floci pero que debe revisarse antes de utilizarla en produccion.
 
 ### Glue
 
@@ -201,7 +207,21 @@ Glue describe:
 
 Athena consulta los objetos de S3 usando la informacion del catalogo Glue. El workgroup `realtime-pipeline-workgroup` fuerza que los resultados se guarden en el bucket de resultados.
 
-Ya existen dos queries analiticas: `queries/cycle_kpis.sql` calcula tiempos y variabilidad, y `queries/data_quality.sql` agrupa problemas de calidad. Todavia falta conectar esos resultados a un dashboard y generar alertas automaticas.
+Ya existen dos queries analiticas: `queries/cycle_kpis.sql` calcula tiempos y variabilidad, y `queries/data_quality.sql` agrupa problemas de calidad.
+
+### Grafana
+
+Grafana es el dashboard ejecutivo. Se levanta con `docker compose up -d` y queda disponible en `http://localhost:3001` (usuario y contraseña `admin`).
+
+La configuracion se hace por codigo (provisioning), no a mano:
+
+- `grafana/provisioning/datasources/athena.yml` declara un datasource de tipo `grafana-athena-datasource` con `endpoint: http://floci:4566` y credenciales `test`. Esto es lo que le permite hablar con Athena a traves de Floci.
+- `grafana/provisioning/dashboards/default.yml` indica a Grafana que cargue los JSON de `grafana/dashboards/`.
+- `grafana/dashboards/manufacturing-kpis.json` define el dashboard **Manufacturing KPIs** con dos paneles: tiempo de ciclo por estacion y calidad por estacion y estado.
+
+El plugin `grafana-athena-datasource` se instala automaticamente al arrancar via `GF_INSTALL_PLUGINS`. En AWS real se quita el `endpoint` y se usan credenciales o rol reales; el dashboard queda igual.
+
+Todavia falta conectar alertas automaticas sobre desviaciones de tiempo de ciclo.
 
 ## 4. Terraform
 
@@ -335,9 +355,13 @@ Declara:
 
 - `aws_s3_bucket.data_lake`.
 - `aws_s3_bucket_versioning.data_lake`.
+- `aws_s3_bucket_server_side_encryption_configuration.data_lake`.
+- `aws_s3_bucket_public_access_block.data_lake`.
 - `aws_s3_bucket.athena_results`.
+- `aws_s3_bucket_server_side_encryption_configuration.athena_results`.
+- `aws_s3_bucket_public_access_block.athena_results`.
 
-El data lake conserva versionado. Esto permite mantener versiones anteriores de objetos, aunque en AWS real debe acompañarse de reglas lifecycle y una politica de retencion.
+El data lake conserva versionado. Ambos buckets cifran los objetos en reposo con SSE-S3 (AES256) y bloquean el acceso publico. En AWS real convendria acompañar el versionado con reglas lifecycle y una politica de retencion.
 
 ### `terraform/lambda.tf`
 
@@ -370,11 +394,12 @@ sts:AssumeRole
 `aws_iam_role_policy.lambda_permissions` permite:
 
 - Leer registros y metadatos de Kinesis.
-- Leer, insertar y actualizar elementos de DynamoDB.
+- Insertar `event_id` en la tabla de deduplicacion (`dynamodb:PutItem`).
+- Consultar y actualizar la tabla de correlacion (`dynamodb:Query` y `dynamodb:UpdateItem`).
 - Escribir objetos en el data lake S3.
-- Crear grupos y streams de logs.
+- Crear el grupo y los streams de logs de la Lambda.
 
-Los permisos de Kinesis estan limitados al ARN del stream. Los permisos DynamoDB estan limitados a las tres tablas del proyecto. El permiso de logs usa `Resource = "*"`; en una version de produccion deberia limitarse a los grupos de logs concretos si el servicio y el ciclo de creacion lo permiten.
+Los permisos estan limitados al minimo necesario: Kinesis solo al ARN del stream, DynamoDB separado por tabla y accion, S3 solo `PutObject` sobre el data lake, y logs limitados al grupo `/aws/lambda/realtime-pipeline-processor`. La tabla `shard_checkpoints` no recibe permisos porque el handler aun no la usa.
 
 #### Funcion Lambda
 
@@ -430,19 +455,19 @@ resource "aws_dynamodb_table" "event_deduplication" {
 
 La razon es que `correlation_state` tiene como clave `piece_id + station_id`, pero esa clave no identifica de forma unica cada entrega. Un mismo evento puede repetirse despues de que la pieza avance a otra estacion. Por eso la identidad tecnica del evento se separa del estado de negocio.
 
-La tabla habilita TTL en `expires_at`. Lambda inserta el evento con una condicion atomica. Si ya existe, DynamoDB rechaza la escritura condicional y Lambda lo cuenta como duplicado.
+La tabla habilita TTL en `expires_at`. Lambda inserta el evento con una condicion atomica dentro de una transaccion DynamoDB (`TransactWriteItems`). Si ya existe, la transaccion se cancela y Lambda lo cuenta como duplicado.
 
-#### Permisos IAM ampliados
+#### Permisos IAM de minimo privilegio
 
-En `terraform/lambda.tf`, el ARN de `event_deduplication` se agrego a la lista de recursos DynamoDB de la politica de Lambda. Sin este cambio, el codigo Python podria existir, pero la funcion fallaria con `AccessDeniedException` al intentar registrar un `event_id`.
+En `terraform/lambda.tf`, los permisos se separaron por tabla y por accion para aplicar minimo privilegio:
 
-La politica ya tenia permisos `PutItem`, `UpdateItem`, `Query` y `GetItem`. Esos permisos cubren:
+- `dynamodb:PutItem` solo sobre `event_deduplication`.
+- `dynamodb:Query` y `dynamodb:UpdateItem` solo sobre `correlation_state`.
+- Se elimino `dynamodb:GetItem`, que el handler no usa.
+- La tabla `shard_checkpoints` no recibe permisos, porque aun no participa del flujo.
+- Los permisos de logs se limitaron al grupo `/aws/lambda/realtime-pipeline-processor`, separando `CreateLogGroup` (sobre el grupo) de `CreateLogStream`/`PutLogEvents` (sobre los streams del grupo).
 
-- `PutItem` en deduplicacion.
-- `Query` para leer las estaciones existentes de una pieza.
-- `UpdateItem` para actualizar el estado de correlacion.
-
-En AWS real convendria separar estas acciones por tabla y reducirlas aun mas. En Floci se mantienen agrupadas para conservar una configuracion simple.
+El objetivo es que un fallo de permisos apunte a un recurso concreto y no a una politica amplia dificil de auditar.
 
 #### Variables de entorno de Lambda
 
@@ -692,10 +717,11 @@ El producer no garantiza por si mismo el procesamiento exactamente una vez. Kine
 
 ## 7.5. Analisis de calidad en Athena
 
-El esquema Glue de `processed_events` incluye ahora:
+El esquema Glue de `processed_events` incluye:
 
 - `quality_status` como `string`.
-- `missing_stations` como `array<string>`.
+
+(`missing_stations` se escribe en el JSON de S3, pero no se declara en el esquema Glue local; ver nota en la seccion 7.)
 
 La query `queries/data_quality.sql` agrupa por estación y estado:
 
@@ -711,7 +737,7 @@ GROUP BY station_id, quality_status
 
 En la validación del 9 de septiembre se publicaron dos piezas normales y una pieza con el perfil `gaps`. Lambda procesó ocho objetos y Athena devolvió estados `ok` para los eventos normales y `gap` para `inspection` de la pieza incompleta, con `missing_stations` igual a `assembly`.
 
-El script `bootstrap-catalog.sh` ahora es reutilizable: conserva la base Glue existente, actualiza la tabla Glue y conserva el workgroup Athena si ya existe. Floci no implementa `UpdateWorkGroup`, por lo que no se intenta actualizar ese recurso automáticamente.
+El esquema de `processed_events` se declara en `terraform/glue.tf`; agregar una columna nueva implica editar ese archivo y volver a aplicar Terraform.
 
 ## 6. Handler de Lambda
 
@@ -722,7 +748,8 @@ El handler esta en `src/processor/handler.py`.
 Usa:
 
 - `base64` para decodificar los datos de Kinesis.
-- `json` para interpretar el payload.
+- `json` para interpretar el payload y emitir logs estructurados.
+- `logging` para los logs estructurados.
 - `boto3` para llamar DynamoDB y S3.
 - `ClientError` para distinguir duplicados de errores reales.
 
@@ -751,15 +778,15 @@ Si falta alguno, lanza `ValueError`. Esto hace que un evento mal formado no se m
 
 ### Idempotencia
 
-La funcion `is_duplicate` intenta insertar `event_id` en DynamoDB con una condicion:
+La funcion `record_event` registra el `event_id` y actualiza el estado en una unica transaccion DynamoDB (`TransactWriteItems`). El primer item de la transaccion es un `Put` sobre `event_deduplication` con la condicion:
 
 ```text
 attribute_not_exists(event_id)
 ```
 
-Hay dos resultados normales:
+Si la condicion falla, la transaccion entera se cancela con `TransactionCanceledException` y, revisando `CancellationReasons`, Lambda distingue el duplicado. Hay dos resultados normales:
 
-1. La insercion funciona: el evento es nuevo y se procesa.
+1. La transaccion funciona: el evento es nuevo y se procesa.
 2. La condicion falla: el evento ya existe y se cuenta como duplicado.
 
 Cualquier otro `ClientError` se vuelve a lanzar. Esto es importante porque no se deben ocultar errores de red, permisos o disponibilidad simulando que son duplicados.
@@ -768,21 +795,20 @@ El registro de deduplicacion incluye `expires_at` para que DynamoDB pueda elimin
 
 ### Persistencia
 
-La funcion `persist_event` escribe tres resultados logicos.
+La persistencia esta dividida en dos funciones: `write_to_s3` (S3) y `record_event` (DynamoDB).
 
-#### Evento raw en S3
+#### Eventos raw y processed en S3
 
-Guarda el payload original en:
+La funcion `write_to_s3` escribe dos objetos con la misma clave base `YYYY-MM-DD/event-id.json`:
 
-```text
-raw/YYYY-MM-DD/event-id.json
-```
+- `raw/...`: el payload original, tal como llego de Kinesis.
+- `processed/...`: el JSON normalizado con `quality_status` y, si aplica, `missing_stations`. Esta ubicacion es la que Glue registra para que Athena la consulte.
 
-Esto conserva lo que realmente llego al pipeline.
+La clave es determinista (basada en `event_id`), de modo que escribir el mismo objeto dos veces es idempotente.
 
 #### Estado de correlacion en DynamoDB
 
-Actualiza `correlation_state` usando:
+La funcion `record_event` registra la deduplicacion y actualiza `correlation_state` en una unica transaccion, usando:
 
 ```text
 piece_id + station_id
@@ -799,34 +825,21 @@ Los atributos actualizados son:
 
 El estado representa el ultimo evento conocido para esa pieza en esa estacion.
 
-#### Evento procesado en S3
-
-Guarda el JSON normalizado en:
-
-```text
-processed/YYYY-MM-DD/event-id.json
-```
-
-Esta ubicacion es la que Glue registra para que Athena pueda consultarla.
-
 ### Funcion principal
 
 `lambda_handler` crea clientes DynamoDB y S3 usando el endpoint de `AWS_ENDPOINT_URL` cuando esta disponible.
 
-Despues:
+Despues, para cada registro del lote:
 
-1. Obtiene las variables de entorno de tablas, bucket y orden de estaciones.
-2. Crea clientes boto3 para DynamoDB y S3. En Floci, `AWS_ENDPOINT_URL` redirige esos clientes a `localhost:4566`; en AWS real queda vacio y boto3 usa los endpoints normales.
-3. Recorre los registros recibidos en el lote de Kinesis.
-4. Decodifica Base64 y valida el esquema.
-5. Registra el `event_id` con una condicion atomica.
-6. Consulta las estaciones ya conocidas de la pieza mediante `Query` sobre `piece_id`.
-7. Compara timestamps para detectar `out_of_order`.
-8. Compara la secuencia esperada con las estaciones existentes para detectar `gap`.
-9. Escribe siempre raw y processed en S3 para conservar auditoria.
-10. Actualiza DynamoDB solo si el evento no es atrasado; un evento `out_of_order` no sobrescribe el estado mas reciente.
-11. Cuenta eventos procesados, duplicados, gaps y eventos fuera de orden.
-12. Devuelve un resumen de la invocacion.
+1. Decodifica Base64 y valida el esquema.
+2. Consulta las estaciones ya conocidas de la pieza mediante `Query` sobre `piece_id`, recorriendo todas las paginas.
+3. Compara timestamps para detectar `out_of_order` y la secuencia esperada para detectar `gap`.
+4. Escribe raw y processed en S3 (clave determinista, idempotente).
+5. Registra el `event_id` y actualiza el estado en una unica transaccion DynamoDB. Si el `event_id` ya existia, la transaccion se cancela, cuenta el duplicado y pasa al siguiente registro.
+6. Un evento `out_of_order` solo registra la deduplicacion, sin sobrescribir el estado mas reciente.
+7. Emite un log estructurado por evento.
+
+Al final cuenta eventos procesados, duplicados, gaps y eventos fuera de orden, emite un log de resumen y devuelve el conteo de la invocacion.
 
 Ejemplo de respuesta:
 
@@ -841,7 +854,7 @@ Ejemplo de respuesta:
 
 ### Funcion `assess_event`
 
-`assess_event` consulta todos los elementos de `correlation_state` que pertenecen a la pieza. A partir de esa respuesta construye tres conjuntos de informacion:
+`assess_event` consulta todos los elementos de `correlation_state` que pertenecen a la pieza, recorriendo todas las paginas de la respuesta (DynamoDB pagina a 1 MB). A partir de esa respuesta construye tres conjuntos de informacion:
 
 - estaciones ya vistas;
 - timestamps ya registrados;
@@ -858,9 +871,11 @@ Para detectar un gap, toma las estaciones que aparecen antes de la estacion actu
 }
 ```
 
+Si `station_id` no esta en `STATION_ORDER`, no se reportan gaps falsos: la funcion devuelve `ok` sin estaciones faltantes.
+
 ### Tratamiento de eventos fuera de orden
 
-Un evento atrasado no se elimina. Se guarda en S3 porque forma parte de la historia recibida y puede ser importante para auditoria. Sin embargo, `persist_event` recibe `update_state=False`, por lo que no reemplaza el estado mas reciente de la pieza en DynamoDB.
+Un evento atrasado no se elimina. Se guarda en S3 porque forma parte de la historia recibida y puede ser importante para auditoria. Sin embargo, para ese evento la transaccion solo registra la deduplicacion (no incluye el `Update` de estado), por lo que no reemplaza el estado mas reciente de la pieza en DynamoDB.
 
 Esta es una politica de consistencia deliberada: el data lake conserva la verdad observada y DynamoDB conserva el estado operativo actual. Una politica mas avanzada podria recalcular la secuencia completa por timestamp, pero no se debe mezclar esa decision con la primera version del pipeline.
 
@@ -884,110 +899,37 @@ La tabla `shard_checkpoints` no participa aun en este flujo. El checkpoint de le
 
 ## 7. Catalogo Glue y Athena
 
-El script `scripts/bootstrap-catalog.sh` crea recursos que no se gestionan actualmente con Terraform en Floci.
+La base/tabla Glue y el workgroup Athena se gestionan con Terraform, en los archivos `terraform/glue.tf` y `terraform/athena.tf`.
 
-### Por que no estan en Terraform
+### Base y tabla Glue (`terraform/glue.tf`)
 
-Floci tiene una limitacion con llamadas relacionadas con tags de Athena y Glue. El provider AWS puede intentar ejecutar esas llamadas durante el refresh aunque no se hayan definido tags.
+- `aws_glue_catalog_database.realtime_pipeline` crea la base `realtime_pipeline_db`.
+- `aws_glue_catalog_table.processed_events` describe la tabla `processed_events`:
+  - ubicacion: `s3://realtime-pipeline-data-lake/processed/`;
+  - tipo `EXTERNAL_TABLE`, clasificacion `json`;
+  - serializador `org.openx.data.jsonserde.JsonSerDe`;
+  - columnas: `piece_id` (string), `station_id` (string), `event_type` (string), `event_timestamp` (timestamp), `cycle_time_seconds` (double) y `quality_status` (string);
+  - clave de particion: `event_date` (string), derivada del path `event_date=YYYY-MM-DD/`.
 
-Por eso el proyecto crea por CLI:
+### Workgroup Athena (`terraform/athena.tf`)
 
-- Base Glue.
-- Tabla Glue.
-- Workgroup Athena.
+- `aws_athena_workgroup.realtime_pipeline` crea `realtime-pipeline-workgroup`, obliga a usar su ubicacion de resultados (`enforce_workgroup_configuration = true`) y escribe los resultados en `s3://realtime-pipeline-athena-results/`.
 
-En AWS real, estos recursos deberian volver a declararse en Terraform.
+### Particionado por fecha
 
-### Base Glue
+Lambda escribe los eventos procesados en `processed/event_date=YYYY-MM-DD/event-id.json`, y la tabla Glue declara `event_date` como clave de particion. Asi Athena puede filtrar por fecha y leer solo la carpeta correspondiente en lugar de escanear todo `processed/`.
 
-Crea la base:
+Floci 2.1.0 descubre las particiones automaticamente desde el path (no hace falta `MSCK REPAIR TABLE`, que ademas no esta soportado en Floci).
 
-```text
-realtime_pipeline_db
-```
+### Nota: `missing_stations` fuera del esquema
 
-### Tabla Glue
+El campo `missing_stations` (presente solo en los eventos `gap`) se quito del esquema Glue local: Floci/DuckDB no puede proyectar una columna opcional dentro de una tabla particionada. La Lambda sigue escribiendo ese campo en el JSON de S3, pero Athena no lo consulta. En AWS real convendria restaurarlo como `array<string>` en el esquema.
 
-Crea la tabla:
+### Por que ahora va por Terraform
 
-```text
-processed_events
-```
-
-Su ubicacion es:
-
-```text
-s3://realtime-pipeline-data-lake/processed/
-```
-
-La tabla declara estas columnas:
-
-- `piece_id` como `string`.
-- `station_id` como `string`.
-- `event_type` como `string`.
-- `event_timestamp` como `timestamp`.
-- `cycle_time_seconds` como `double`.
-- `quality_status` como `string`.
-- `missing_stations` como `array<string>`.
-
-El script configura el formato JSON y el serializador correspondiente.
-
-### Workgroup Athena
-
-Crea:
-
-```text
-realtime-pipeline-workgroup
-```
-
-Y fuerza los resultados a:
-
-```text
-s3://realtime-pipeline-athena-results/
-```
-
-### Comportamiento actual de `bootstrap-catalog.sh`
-
-El script usa `set -euo pipefail`: termina ante errores, variables no definidas o errores dentro de tuberias. Esto evita continuar con un catalogo parcialmente creado.
-
-Antes de crear la base Glue ejecuta `get-database`. Si la base existe, la conserva. Si no existe, ejecuta `create-database`.
-
-Para `processed_events`, ejecuta `get-table`. Si existe, ejecuta `update-table` con el nuevo esquema; si no existe, ejecuta `create-table`. Este cambio permite agregar columnas como `quality_status` sin tener que destruir todo el entorno.
-
-Para Athena ejecuta `get-work-group`. Si existe, lo conserva porque Floci no implementa `UpdateWorkGroup`. Si no existe, ejecuta `create-work-group` con la ubicacion de resultados.
-
-Este comportamiento es idempotente dentro de las limitaciones de Floci: se puede repetir el bootstrap sin recibir `AlreadyExists` para la base, tabla o workgroup.
-
-La configuracion de AWS CLI tambien exporta credenciales ficticias `test`. Floci no valida esas credenciales, pero el SDK exige que exista una fuente de credenciales para firmar las llamadas.
-
-### Lectura profesional de `bootstrap-catalog.sh`
-
-El script puede explicarse en esta secuencia:
-
-1. `#!/usr/bin/env bash` indica que debe ejecutarse con Bash.
-2. `set -euo pipefail` activa tres protecciones: detenerse ante errores, rechazar variables no definidas y propagar errores dentro de pipelines.
-3. Las variables `ENDPOINT`, `REGION`, `DB_NAME` y `WORKGROUP_NAME` centralizan la configuracion local.
-4. Las variables `AWS_ACCESS_KEY_ID` y `AWS_SECRET_ACCESS_KEY` reciben `test` por defecto. Son credenciales de emulacion, no credenciales reales.
-5. `aws_floci` es una funcion envoltorio. Su objetivo es repetir las variables de entorno y ejecutar el binario `aws` con los argumentos recibidos.
-6. `DATA_LAKE_BUCKET` y `RESULTS_BUCKET` documentan los nombres esperados por el diseno. La ruta de la tabla se escribe dentro del JSON porque la tabla Glue necesita una ubicacion S3 concreta.
-7. `get-database` comprueba si la base ya existe. Si existe, el script imprime un mensaje y no intenta crearla de nuevo.
-8. `TABLE_INPUT` es un string JSON que describe la tabla Glue. Contiene nombre, tipo, columnas, formato de entrada, formato de salida, serializer y ubicacion S3.
-9. `get-table` decide entre `update-table` y `create-table`. Esta es la parte que permite evolucionar el esquema agregando `quality_status` y `missing_stations`.
-10. `WORKGROUP_CONFIG` define donde Athena debe escribir resultados y si debe imponer esa configuracion.
-11. `get-work-group` comprueba la existencia del workgroup. Si ya existe, se conserva debido a la falta de soporte de `UpdateWorkGroup` en Floci.
-12. Si no existe, `create-work-group` lo crea.
-
-El script no procesa eventos y no ejecuta SQL. Su responsabilidad termina cuando Glue conoce la tabla y Athena tiene un workgroup con un bucket de resultados.
-
-### Diferencia entre crear y actualizar la tabla Glue
-
-`create-table` se usa la primera vez. Si se ejecutara siempre, la segunda ejecucion fallaria porque la tabla ya existe.
-
-`update-table` se usa cuando la tabla ya existe y se quiere reemplazar su definicion. En este proyecto fue necesario cuando Lambda comenzo a escribir `quality_status` y `missing_stations`; el catalogo tenia que conocer esas columnas para que Athena pudiera consultarlas.
+Durante un tiempo esto se creaba por CLI (`scripts/bootstrap-catalog.sh`) porque Floci no implementaba `ListTagsForResource` de Athena, una llamada que `terraform-provider-aws` hace al refrescar `aws_athena_workgroup`. Quedo corregido en Floci 2.1.0 (issue [#2791](https://github.com/floci-io/floci/issues/2791)), por lo que todo el despliegue es 100% Terraform.
 
 El esquema Glue no transforma los archivos. Solo le dice al motor como interpretarlos. Si el JSON real y el esquema declarado no coinciden, Athena puede devolver errores, valores nulos o resultados incorrectos.
-
-En AWS real, el script no deberia ser la fuente definitiva de infraestructura. Glue y Athena deberian convertirse en recursos Terraform, porque AWS real soporta las llamadas de tags que causan problemas en Floci.
 
 El flujo seguro para repetir desde cero es:
 
@@ -1051,22 +993,14 @@ Orquesta el despliegue local:
 3. Entra en `terraform/`.
 4. Ejecuta `terraform init -input=false`.
 5. Ejecuta `terraform apply -auto-approve`.
-6. Ejecuta `bootstrap-catalog.sh`.
-7. Muestra los outputs de Terraform.
-
-### `scripts/bootstrap-catalog.sh`
-
-Crea Glue y Athena por AWS CLI contra Floci. Exporta credenciales ficticias por defecto y pasa explicitamente esas variables a cada llamada AWS CLI.
+6. Muestra los outputs de Terraform.
 
 ### `scripts/teardown.sh`
 
 Elimina el entorno local en orden inverso:
 
-1. Workgroup Athena.
-2. Tabla Glue.
-3. Base Glue.
-4. Recursos administrados por Terraform.
-5. Opcionalmente el contenedor Floci.
+1. Destruye los recursos administrados por Terraform (incluidos Glue y Athena).
+2. Opcionalmente detiene el contenedor Floci.
 
 Exige escribir `DELETE` y solo permite endpoints locales `localhost:4566` o `127.0.0.1:4566`. Esto evita ejecutar por accidente un `destroy` contra AWS real.
 
@@ -1139,9 +1073,10 @@ Una ejecucion local completa tiene este orden:
 # Levantar infraestructura
 ./scripts/deploy.sh
 
-# Preparar dependencias del producer
+# Preparar dependencias del producer y del processor
 python3 -m venv .venv
 .venv/bin/python -m pip install -r src/producer/requirements.txt
+.venv/bin/python -m pip install -r src/processor/requirements.txt
 
 # Publicar eventos
 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \\
@@ -1182,7 +1117,9 @@ El README original menciona checkpointing propio, pero el handler actual no escr
 
 ### Atomicidad
 
-Actualmente el flujo registra primero la deduplicacion y despues escribe S3 y DynamoDB. Si la escritura posterior falla, un reintento podria encontrar el `event_id` ya registrado y saltarse el evento. En una version mas robusta se podria usar una transaccion DynamoDB, un estado intermedio o un patron de reintento/outbox.
+El flujo escribe primero S3 (idempotente por clave determinista) y despues registra la deduplicacion y actualiza el estado. Esto evita perder datos raw y processed si la Lambda falla a mitad del procesamiento: un reintento reescribe el mismo objeto y vuelve a intentar la transaccion.
+
+La escritura de deduplicacion y la actualizacion de `correlation_state` se hacen en una unica transaccion DynamoDB (`TransactWriteItems`), por lo que son atomicas: o ambas se aplican o ninguna. Si la Lambda falla en medio, la transaccion se revierte y no queda trabajo a medias.
 
 ### Eventos fuera de orden
 
@@ -1190,19 +1127,19 @@ El estado de correlacion se actualiza con el ultimo evento recibido, no necesari
 
 ### S3 y seguridad
 
-Faltan cifrado explicito, bloqueo de acceso publico, lifecycle y politicas de retencion. Son tareas necesarias para una demostracion de produccion.
+Los buckets ya tienen cifrado en reposo (SSE-S3) y bloqueo de acceso publico. Faltan reglas lifecycle y politicas de retencion para limitar el crecimiento del data lake y de las versiones de objetos.
 
 ### IAM
 
-Los permisos son funcionales para el entorno local, pero deben revisarse con minimo privilegio en AWS real. En particular, los permisos de logs usan `Resource = "*"`.
+Los permisos ya estan separados por tabla y accion, y los logs estan limitados al grupo de la Lambda. En AWS real convendria acotar el ARN de logs con la cuenta y region reales (hoy se usan comodines `*:*` por la limitacion del emulador).
 
 ### Catalogo
 
-Glue y Athena aun dependen de un script CLI en Floci. Para AWS real deben gestionarse desde Terraform para que todo el entorno sea reproducible.
+Glue y Athena ya se gestionan con Terraform (`glue.tf` y `athena.tf`), igual que el resto de la infraestructura.
 
 ### Observabilidad
 
-Faltan metricas de negocio como:
+La Lambda ya emite logs estructurados en JSON por evento y por lote (conteos de `processed`, `duplicates`, `out_of_order` y `gaps`). Todavia faltan metricas y alarmas de negocio en CloudWatch:
 
 - Eventos procesados.
 - Duplicados.
@@ -1226,7 +1163,7 @@ Una explicacion profesional del proyecto deberia destacar:
 
 La afirmacion correcta en el estado actual es:
 
-> El proyecto ya demuestra ingestion streaming, procesamiento serverless, deduplicacion, persistencia en DynamoDB y S3, e infraestructura reproducible con Terraform sobre Floci. La capa analitica Athena y la observabilidad ejecutiva estan preparadas en infraestructura, pero aun deben completarse con queries, dashboards y pruebas adicionales.
+> El proyecto ya demuestra ingestion streaming, procesamiento serverless, deduplicacion, persistencia en DynamoDB y S3, analitica con Athena/Glue (CTEs, `LAG`, `STDDEV_POP`), seguridad basica (cifrado en reposo, minimo privilegio) e infraestructura reproducible con Terraform sobre Floci. Quedan pendientes el dashboard y las alertas en Grafana, y la migracion de Glue/Athena a Terraform en AWS real.
 
 ## 14. Como explicarlo profesionalmente en una conversacion tecnica
 
@@ -1242,7 +1179,7 @@ Una explicacion clara puede seguir este guion:
 
 ### Procesamiento
 
-"Un event source mapping conecta Kinesis con Lambda. Lambda decodifica Base64, valida campos, registra el `event_id` mediante una condicion atomica en DynamoDB y evita procesar dos veces el mismo evento."
+"Un event source mapping conecta Kinesis con Lambda. Lambda decodifica Base64, valida campos, y registra el `event_id` y el estado de la pieza en una unica transaccion DynamoDB, evitando procesar dos veces el mismo evento."
 
 ### Estado operativo
 
@@ -1262,10 +1199,10 @@ Una explicacion clara puede seguir este guion:
 
 ### Infraestructura
 
-"Terraform crea los recursos y las conexiones. Como Floci no soporta completamente las llamadas de tags usadas por el provider AWS, Glue y Athena se inicializan con AWS CLI mediante un script separado. En AWS real esos recursos volverian a Terraform."
+"Terraform crea todos los recursos y las conexiones, incluidos Glue y Athena. Todo el despliegue es 100% infraestructura como codigo y portable a AWS real cambiando solo el provider."
 
 ### Limitaciones honestas
 
-"El checkpoint de negocio explicito aun no esta implementado, la observabilidad y Grafana estan pendientes, y el entorno local de Floci no persiste todos los recursos al detener el contenedor. Estas son mejoras identificadas, no capacidades que el proyecto deba fingir que ya tiene."
+"El checkpoint de negocio explicito aun no esta implementado, las metricas/alarmas y el dashboard de Grafana estan pendientes, y el entorno local de Floci no persiste todos los recursos al detener el contenedor. Estas son mejoras identificadas, no capacidades que el proyecto deba fingir que ya tiene."
 
 Este guion demuestra conocimiento de arquitectura, codigo, persistencia, consistencia, pruebas y limites operativos. La parte importante no es memorizar nombres de servicios, sino explicar que problema resuelve cada uno y que evidencia demuestra que funciona.

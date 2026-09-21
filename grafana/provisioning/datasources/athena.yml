@@ -1,0 +1,18 @@
+apiVersion: 1
+
+datasources:
+  - name: Athena
+    uid: athena
+    type: grafana-athena-datasource
+    access: proxy
+    jsonData:
+      authType: keys
+      defaultRegion: us-east-1
+      endpoint: http://floci:4566
+      catalog: AwsDataCatalog
+      database: realtime_pipeline_db
+      workgroup: realtime-pipeline-workgroup
+      outputLocation: s3://realtime-pipeline-athena-results/
+    secureJsonData:
+      accessKey: test
+      secretKey: test

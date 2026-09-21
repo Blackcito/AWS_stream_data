@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r src/producer/requirements.txt
+          pip install -r src/processor/requirements.txt
+      - name: Run producer tests
+        run: PYTHONPATH=src/producer python -m unittest discover -s src/producer -p 'test_*.py'
+      - name: Run processor tests
+        run: PYTHONPATH=src/processor python -m unittest discover -s src/processor -p 'test_*.py'
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.0"
+      - name: Terraform fmt
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+      - name: Terraform init
+        working-directory: terraform
+        run: terraform init -input=false -backend=false
+      - name: Terraform validate
+        working-directory: terraform
+        run: terraform validate
+
+  plan:
+    runs-on: ubuntu-latest
+    services:
+      floci:
+        image: floci/floci:2.1.0
+        ports:
+          - 4566:4566
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.0"
+      - name: Wait for Floci
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:4566/_floci/init >/dev/null 2>&1; then
+              echo "Floci ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Floci did not become ready" >&2
+          exit 1
+      - name: Terraform init
+        working-directory: terraform
+        run: terraform init -input=false
+      - name: Terraform plan
+        working-directory: terraform
+        run: terraform plan -input=false -lock=false

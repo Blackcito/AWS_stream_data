@@ -19,8 +19,5 @@ cd "$ROOT_DIR/terraform"
 terraform init -input=false
 terraform apply -auto-approve
 
-echo "==> Creando catálogo Glue y workgroup Athena (CLI, limitación de Floci)..."
-bash "$ROOT_DIR/scripts/bootstrap-catalog.sh"
-
 echo "==> Listo. Outputs:"
 terraform output

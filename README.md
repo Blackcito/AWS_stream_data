@@ -2,18 +2,28 @@
 
 Pipeline de analítica en tiempo real para planta de manufactura: eventos de sensores, scanner y cinta transportadora se ingieren en streaming, se correlacionan por pieza a través de estaciones, y se exponen como KPIs de ciclo y eficiencia en un dashboard ejecutivo.
 
-Está construido con Kinesis, Lambda, DynamoDB, S3, Athena y Glue — la misma arquitectura que usaría en AWS real — pero corre en local con [Floci](https://floci.io), sin costo ni cuenta de AWS. El `provider` de Terraform apunta a `http://localhost:4566`; el día que este proyecto necesite ir a producción, el cambio es una variable de entorno, no una reescritura.
+Está construido con Kinesis, Lambda, DynamoDB, S3, Athena y Glue — la misma arquitectura que usaría en AWS real — pero corre en local con [Floci](https://floci.io), sin costo ni cuenta de AWS. El `provider` de Terraform apunta a `http://localhost:4566`.
 
-Floci es un emulador AWS de código abierto (reemplazo directo de LocalStack) que necesita Docker para dos piezas de esta arquitectura: **Lambda** corre en contenedores reales con las imágenes oficiales `public.ecr.aws/lambda/*`, y **Athena** ejecuta SQL real mediante un sidecar **DuckDB** (`floci-duck`) que consulta S3 a través del catálogo de Glue.
+
+## Autoría
+
+Este proyecto es de mi autoría: el diseño de la arquitectura, el código (productor, Lambda, Terraform, scripts y queries), la configuración del dashboard y esta documentación.
+
+Para ejecutarlo en local uso herramientas de terceros como soporte:
+
+- **[Floci](https://floci.io)**: emulador open-source de AWS que reproduce Kinesis, Lambda, DynamoDB, S3, Glue y Athena en local.
+- **[Floci-dash](https://github.com/ofsazib/floci-dash)**: interfaz web de administración de Floci (imagen `ghcr.io/ofsazib/floci-dash`).
+- **Grafana**, **Terraform**, **Docker** y **boto3**: herramientas para el dashboard, la infraestructura como código, los contenedores y el SDK de AWS.
+
+Lo que es mío es la solución construida encima de ellas: el pipeline, su lógica de negocio y su infraestructura.
 
 ## Por qué este proyecto
 
-Diseñé este pipeline replicando un problema real de planta: correlacionar eventos de una misma pieza a medida que pasa por distintas estaciones, calcular tiempos de ciclo y detectar variabilidad — el mismo tipo de lógica de correlación temporal que trabajé en Rosen. La diferencia acá es que además de la lógica, está la infraestructura completa: streaming, procesamiento serverless, almacenamiento en dos niveles (estado caliente en DynamoDB, histórico en S3) y consultas analíticas con SQL avanzado (CTEs, `LAG`, `STDDEV_POP`).
+Diseñé este pipeline replicando un problema real de planta: correlacionar eventos de una misma pieza a medida que pasa por distintas estaciones, calcular tiempos de ciclo y detectar variabilidad. Esta es la infraestructura completa: streaming, procesamiento serverless, almacenamiento en dos niveles (estado caliente en DynamoDB, histórico en S3) y consultas analíticas con SQL avanzado (CTEs, `LAG`, `STDDEV_POP`).
 
 **Lo que este proyecto demuestra:**
 - Diseño de infraestructura como código (Terraform) portable entre local y AWS real
 - Arquitectura de streaming con garantías de idempotencia y checkpointing
-- Separación clara entre infraestructura y lógica de negocio
 - SQL analítico sobre un data lake (Athena/Glue) con funciones de ventana
 - Un proyecto que se puede clonar y correr en minutos, sin pedir acceso a nadie
 
@@ -26,7 +36,7 @@ Simulador de eventos (sensores, scanner, cinta)
         Kinesis  ──────────────────────  Stream de eventos
             │
             ▼
-        Lambda  ───────────────────────  Correlación y checkpointing
+        Lambda  ───────────────────────  Correlación, deduplicación y calidad
          │            │
          ▼            ▼
    DynamoDB          S3
@@ -37,60 +47,54 @@ Simulador de eventos (sensores, scanner, cinta)
                 Athena + Glue  ─────────  KPIs de ciclo y eficiencia
                       │
                       ▼
-                  Grafana  ─────────────  Dashboard ejecutivo
+                   Grafana  ─────────────  Dashboard ejecutivo
 ```
 
 | Componente | Rol |
 |---|---|
 | **Simulador de eventos** | Genera eventos sintéticos que imitan sensores, scanner de código de barras y cinta transportadora. |
 | **Kinesis** | Ingesta del stream de eventos en orden, particionado por shard. |
-| **Lambda** | Correlaciona eventos de una misma pieza entre estaciones y hace checkpointing para garantizar idempotencia. |
+| **Lambda** | Correlaciona eventos de una misma pieza entre estaciones, los deduplica y clasifica su calidad. |
 | **DynamoDB** | Estado de correlación: qué piezas están "en tránsito" entre estaciones. |
 | **S3** | Data lake con eventos raw y procesados. |
 | **Athena + Glue** | SQL sobre S3 (CTEs, `LAG`, `STDDEV_POP`) para tiempos de ciclo y variabilidad por estación. |
-| **Grafana** | Dashboard ejecutivo con los KPIs resultantes. |
+| **Grafana** | Dashboard ejecutivo con los KPIs resultantes (datasource Athena contra Floci). |
 
 ## Decisiones de diseño
 
-- **Idempotencia en Lambda**: cada evento trae un ID único; se verifica en DynamoDB si ya fue procesado antes de escribir, evitando duplicados por reintentos de Kinesis.
-- **Checkpointing**: se guarda el último `sequenceNumber` procesado por shard, para reanudar sin reprocesar ni perder eventos ante un fallo de Lambda.
+- **Idempotencia en Lambda**: cada evento trae un ID único; se registra en DynamoDB con una escritura condicional y se conserva en S3 con clave determinista, de modo que un reintento de Kinesis no duplica su efecto.
+- **Checkpointing de lectura**: lo administra el event source mapping de Lambda (Kinesis registra por shard el `sequenceNumber` ya consumido). La tabla `shard_checkpoints` queda reservada para checkpoints de negocio explícitos, aún no implementados.
 - **Infra 100% portable**: el `main.tf` no tiene nada hardcodeado a "local"; el endpoint es una variable, así que el mismo código sirve para Floci y para AWS real.
 - **Separación infra/código**: `terraform/` no sabe nada de la lógica de negocio; `src/` no sabe nada de cómo se aprovisiona.
 - **Athena con DuckDB**: en Floci, Athena es DuckDB detrás de la API de Athena — SQL real (CTEs, `LAG`, `STDDEV_POP`) sobre S3/Glue, sin mantener un servicio de cómputo corriendo 24/7.
-
-## Estado actual
-
-- [x] Infraestructura base (Kinesis, Lambda, DynamoDB, S3) vía Terraform, corriendo sobre Floci
-- [x] Catálogo Glue y workgroup Athena vía CLI (limitación de Floci)
-- [x] Simulador de eventos (producer) con partición por `piece_id`
-- [x] Perfiles de fallo reproducibles: duplicados, fuera de orden y gaps
-- [x] Lógica de correlación, deduplicación y persistencia raw/processed en Lambda
-- [x] Clasificación de calidad en Lambda: `ok`, `gap` y `out_of_order`
-- [x] Primera query de Athena con CTEs, `LAG` y métricas de variabilidad
-- [x] Métricas Athena de calidad por estación y estado
-- [ ] Dashboard en Grafana
 
 ## Estructura de repo
 
 ```
 aws-realtime-pipeline/
-├── terraform/               # Kinesis, Lambda, DynamoDB, S3, IAM
+├── terraform/               # Kinesis, Lambda, DynamoDB, S3, Glue, Athena, IAM
 │   ├── main.tf
 │   ├── variables.tf
 │   ├── kinesis.tf
 │   ├── dynamodb.tf
 │   ├── s3.tf
 │   ├── lambda.tf
+│   ├── glue.tf
+│   ├── athena.tf
 │   └── outputs.tf
 ├── src/
-│   ├── producer/             # simulador de eventos (Python) → Kinesis  [próximo paso]
-│   └── processor/            # código de la Lambda (placeholder por ahora)
-├── docker-compose.yml        # Floci
+│   ├── producer/             # simulador de eventos (Python) → Kinesis
+│   └── processor/            # código de la Lambda
+├── queries/
+│   ├── cycle_kpis.sql        # KPIs de ciclo y variabilidad
+│   └── data_quality.sql      # calidad por estación y estado
 ├── scripts/
 │   ├── deploy.sh             # levanta Floci y aplica terraform
-│   └── bootstrap-catalog.sh  # crea catálogo Glue + workgroup Athena (CLI)
+│   └── teardown.sh           # destruye recursos locales (controlado)
 ├── grafana/
-│   └── dashboards/
+│   ├── provisioning/         # datasource Athena + provider de dashboards
+│   └── dashboards/           # dashboard JSON de KPIs
+├── docker-compose.yml        # Floci, floci-dash y Grafana
 └── README.md
 ```
 
@@ -135,29 +139,33 @@ PYTHONPATH=src/processor .venv/bin/python -m unittest discover \\
 ./scripts/teardown.sh --stop-floci
 ```
 
-Al terminar, Terraform imprime el stream de Kinesis, las tablas de DynamoDB y los buckets S3. `deploy.sh` además crea por CLI la base/tabla Glue y el workgroup Athena (ver nota abajo).
+Al terminar, Terraform imprime el stream de Kinesis, las tablas de DynamoDB, los buckets S3, la base/tabla Glue y el workgroup Athena.
 
-`teardown.sh` elimina primero el workgroup Athena, la tabla/base Glue y después todos los recursos administrados por Terraform. Requiere escribir `DELETE` para continuar y solo permite destruir el endpoint local de Floci (`localhost:4566`); no debe usarse para AWS real.
-
-### Por qué Glue/Athena van por CLI (limitación de Floci)
-
-Floci no implementa `ListTagsForResource` (Athena) ni `GetTags` sobre bases de datos (Glue), que son justo las llamadas que `terraform-provider-aws` hace al refrescar `aws_athena_workgroup` y `aws_glue_catalog_database` (incluso sin tags configurados). Referencia: [floci issue #2791](https://github.com/floci-io/floci/issues/2791).
-
-Por eso esos tres recursos se crean con `scripts/bootstrap-catalog.sh` contra Floci, y **en AWS real vuelven a Terraform** (ahí esas APIs sí existen).
+`teardown.sh` destruye todos los recursos administrados por Terraform (incluidos Glue y Athena). Requiere escribir `DELETE` para continuar y solo permite destruir el endpoint local de Floci (`localhost:4566`); no debe usarse para AWS real.
 
 ### Procesamiento e idempotencia de Lambda
 
-La Lambda registra cada `event_id` en `realtime-pipeline-event-deduplication` con una escritura condicional. Si Kinesis reintenta el mismo evento, la condición falla y el evento se cuenta como duplicado sin volver a escribir en S3 ni actualizar el estado de la pieza.
+Por cada registro, la Lambda:
 
-Los eventos aceptados se escriben en `raw/` y `processed/` dentro del data lake, y actualizan `realtime-pipeline-correlation-state` por `piece_id` y `station_id`. El checkpoint de lectura de Kinesis lo administra el event source mapping de Lambda; la tabla `shard_checkpoints` queda reservada para checkpoints de negocio explícitos si el diseño los necesita más adelante.
+1. escribe el evento en `raw/` y `processed/` de S3 con claves deterministas (basadas en `event_id`), por lo que la escritura es idempotente;
+2. registra el `event_id` en `realtime-pipeline-event-deduplication` y actualiza `realtime-pipeline-correlation-state` en **una única transacción DynamoDB** (`TransactWriteItems`), salvo que el evento llegue fuera de orden (en ese caso solo se registra la deduplicación).
+
+Si Kinesis reintenta el mismo evento, la escritura condicional falla y la transacción se cancela: el evento se cuenta como duplicado sin actualizar el estado de la pieza. Escribir S3 **antes** garantiza que, si la Lambda falla a mitad del procesamiento y el lote se reintenta, los datos raw y procesados nunca se pierden.
+
+El checkpoint de lectura de Kinesis lo administra el event source mapping de Lambda; la tabla `shard_checkpoints` queda reservada para checkpoints de negocio explícitos si el diseño los necesita más adelante.
 
 ### Primera consulta analítica
 
 La query [queries/cycle_kpis.sql](queries/cycle_kpis.sql) usa dos CTEs y `LAG` para ordenar los eventos por pieza, identificar la estación anterior y calcular métricas agregadas por estación. Athena fue validada sobre nueve eventos sintéticos y devolvió tres eventos por estación, promedios de ciclo de 3, 4 y 5 segundos, y tres segundos de separación media entre estaciones consecutivas.
 
-Floci-Duck no acepta un punto y coma final en esta consulta porque añade internamente su propia cláusula de escritura de resultados. Por eso el archivo SQL termina en `ORDER BY station_id` sin `;`.
 
-La query [queries/data_quality.sql](queries/data_quality.sql) agrupa los eventos procesados por `station_id` y `quality_status`, y cuenta eventos y piezas afectadas. El catálogo Glue incluye ahora `quality_status` y `missing_stations` para que Athena pueda consultar la calidad del pipeline.
+La query [queries/data_quality.sql](queries/data_quality.sql) agrupa los eventos procesados por `station_id` y `quality_status`, y cuenta eventos y piezas afectadas. El catálogo Glue incluye `quality_status` para que Athena pueda consultar la calidad del pipeline.
+
+### Particionado por fecha
+
+Los eventos procesados se guardan en `processed/event_date=YYYY-MM-DD/`, y la tabla Glue declara `event_date` como clave de partición, de modo que Athena puede filtrar por fecha sin escanear todo el data lake. Floci descubre las particiones automáticamente (no soporta `MSCK REPAIR TABLE`).
+
+Nota: el campo opcional `missing_stations` (presente solo en eventos `gap`) se dejó fuera del esquema Glue local porque Floci/DuckDB no puede proyectar columnas opcionales en tablas particionadas; en AWS real se restaura como `array<string>`.
 
 ### Perfiles de fallo del producer
 
@@ -172,18 +180,30 @@ Los perfiles no representan aleatoriedad incontrolable: cada uno cambia una prop
 
 Lambda agrega `quality_status` al evento procesado. En una validación real, `gaps` produjo `missing_stations: ["assembly"]` y `out_of_order` clasificó el evento atrasado sin sobrescribir el estado más reciente de correlación.
 
-## Migración a AWS real
+### Dashboard en Grafana
 
-El cambio principal es el `provider` de Terraform: se elimina el bloque `endpoints` y las credenciales `test`, y se usan credenciales reales. Todo lo demás — recursos, código de Lambda, queries de Athena, dashboards — queda igual.
+Grafana se levanta con `docker compose up -d` y queda en `http://localhost:3001` (usuario `admin`, contraseña `admin`). El datasource Athena se aprovisiona automáticamente apuntando a `http://floci:4566`, y el dashboard **Manufacturing KPIs** se carga desde `grafana/dashboards/`.
 
-La única pieza que sí cambia de lugar: la base/tabla Glue y el workgroup Athena. En Floci se crean por CLI (`scripts/bootstrap-catalog.sh`) por la limitación de tags descrita arriba; en AWS real se vuelven a declarar como recursos Terraform (`aws_glue_catalog_database`, `aws_glue_catalog_table`, `aws_athena_workgroup`), donde esas APIs sí existen.
+El dashboard tiene dos paneles:
+
+- **Tiempo de ciclo por estación**: `event_count`, promedio y desviación estándar de `cycle_time_seconds`.
+- **Calidad por estación y estado**: conteo de eventos y piezas por `quality_status`.
+
+El plugin `grafana-athena-datasource` se instala al arrancar (vía `GF_INSTALL_PLUGINS`) y se configura con un endpoint personalizado y credenciales `test`. En AWS real, se quita el `endpoint` y se usan credenciales/rol reales; el dashboard queda igual.
+
 
 ## Roadmap
 
 - [x] Simulador con distintos perfiles de fallo (eventos fuera de orden, duplicados, gaps)
-- [ ] Alertas en Grafana sobre desviaciones de tiempo de ciclo
-- [ ] CI que valide `terraform plan` contra Floci en cada PR
 - [x] Tests de idempotencia para la Lambda
+- [x] Cifrado SSE-S3 y bloqueo de acceso público en S3
+- [x] IAM de mínimo privilegio (permisos por tabla y log group acotado)
+- [x] Logs estructurados en la Lambda
+- [x] Dashboard en Grafana (datasource Athena)
+- [x] CI que valida `terraform validate`/`fmt` y tests unitarios en cada PR
+- [x] CI con `terraform plan` contra Floci (end-to-end)
+- [x] Atomicidad entre deduplicación y actualización de estado (transacción DynamoDB)
+- [x] Particionado por fecha en la tabla Glue (`event_date`)
 
 ## Licencia
 

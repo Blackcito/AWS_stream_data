@@ -8,6 +8,13 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:z
     security_opt:
       - label=disable
+    environment:
+      - FLOCI_HOSTNAME=floci
+      - FLOCI_BASE_URL=http://floci:4566
+    networks:
+      default:
+        aliases:
+          - localhost.floci.io
 
   floci-dash:
     image: ghcr.io/ofsazib/floci-dash:latest
@@ -16,5 +23,20 @@ services:
       - "3000:3000"
     environment:
       - FLOCI_URL=http://floci:4566
+    depends_on:
+      - floci
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-athena-datasource
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - floci

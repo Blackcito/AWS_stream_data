@@ -36,19 +36,19 @@ resource "aws_iam_role_policy" "lambda_permissions" {
         Resource = aws_kinesis_stream.events.arn
       },
       {
-        Sid    = "DynamoDbReadWrite"
+        Sid      = "DeduplicationWrite"
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem"]
+        Resource = aws_dynamodb_table.event_deduplication.arn
+      },
+      {
+        Sid    = "CorrelationStateReadWrite"
         Effect = "Allow"
         Action = [
-          "dynamodb:GetItem",
-          "dynamodb:PutItem",
-          "dynamodb:UpdateItem",
           "dynamodb:Query",
+          "dynamodb:UpdateItem",
         ]
-        Resource = [
-          aws_dynamodb_table.correlation_state.arn,
-          aws_dynamodb_table.shard_checkpoints.arn,
-          aws_dynamodb_table.event_deduplication.arn,
-        ]
+        Resource = aws_dynamodb_table.correlation_state.arn
       },
       {
         Sid      = "S3Write"
@@ -57,14 +57,19 @@ resource "aws_iam_role_policy" "lambda_permissions" {
         Resource = "${aws_s3_bucket.data_lake.arn}/*"
       },
       {
-        Sid    = "Logs"
+        Sid      = "LogGroupCreate"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup"]
+        Resource = "arn:aws:logs:*:*:log-group:/aws/lambda/${aws_lambda_function.processor.function_name}"
+      },
+      {
+        Sid    = "LogStreamsWrite"
         Effect = "Allow"
         Action = [
-          "logs:CreateLogGroup",
           "logs:CreateLogStream",
           "logs:PutLogEvents",
         ]
-        Resource = "*"
+        Resource = "arn:aws:logs:*:*:log-group:/aws/lambda/${aws_lambda_function.processor.function_name}:*"
       },
     ]
   })
